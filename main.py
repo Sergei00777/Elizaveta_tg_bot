@@ -1,3 +1,5 @@
+
+
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types
@@ -7,24 +9,27 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from mistralai.client import MistralClient
 from datetime import datetime, timedelta
 import pytz
-import sqlite3
+import aiosqlite
 import random
 import os
-
-
-
+from typing import Optional
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("elizabeth_bot.log"),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
-# Конфигурация из переменных окружения
-BOT_TOKEN =  "7529656586:AAHLqQ5mOZXgcl0el8YKBZqiCfp"
-MISTRAL_API_KEY = "3pu7nqyufOMsVOJljn"
-CHANNEL_ID = -1002540  # ID вашего канала
-ADMIN_ID = 43638  # ID администратора
+
+BOT_TOKEN = "7529656586:AAHLqQqiCfp_b-K9vrY"
+MISTRAL_API_KEY = "3pu7Vx7lMufOMsVOJljn"
+CHANNEL_ID = -100540  # ID вашего канала
+ADMIN_ID = 4338  # ID администратора
 MODEL_NAME = "mistral-small-latest"
 TIMEZONE = pytz.timezone('Europe/Moscow')
 DB_FILE = "elizabeth_bot.db"
@@ -34,6 +39,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 mistral_client = MistralClient(api_key=MISTRAL_API_KEY)
 
+# Глобальная переменная для управления автопостингом
+auto_posting_task: Optional[asyncio.Task] = None
+auto_posting_running = False
+
 
 # Проверка прав администратора
 def is_admin(user_id: int) -> bool:
@@ -41,26 +50,26 @@ def is_admin(user_id: int) -> bool:
 
 
 # Инициализация БД
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS posts 
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      content TEXT,
-                      post_type TEXT,
-                      created_at TIMESTAMP,
-                      views INTEGER DEFAULT 0)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS admins
-                     (user_id INTEGER PRIMARY KEY)''')
-    # Добавляем основного администратора, если его нет
-    cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (ADMIN_ID,))
-    conn.commit()
-    conn.close()
+async def init_db():
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            await conn.execute('''CREATE TABLE IF NOT EXISTS posts 
+                                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                 content TEXT,
+                                 post_type TEXT,
+                                 created_at TIMESTAMP,
+                                 views INTEGER DEFAULT 0)''')
+            await conn.execute('''CREATE TABLE IF NOT EXISTS admins
+                                (user_id INTEGER PRIMARY KEY)''')
+            # Добавляем основного администратора, если его нет
+            await conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (ADMIN_ID,))
+            await conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка инициализации БД: {e}")
+        raise
 
 
-init_db()
-
-# Темы для постов
+# Темы для постов (остаются без изменений)
 PERSONAL_STORIES = [
 
     # Путешествия и приключения
@@ -103,11 +112,9 @@ PERSONAL_STORIES = [
     "Дорога как терапия: почему я люблю ездить один(а)",
     "Машины, которые я продал(а) и о которых до сих пор жалею"
 
-
 ]
 
 CAR_NEWS = [
-
     # Новые автомобили и технологии
     "Новые модели автомобилей 2024 года",
     "Электромобили: последние тенденции",
@@ -169,16 +176,14 @@ CAR_NEWS = [
     "Где можно проехать на машине, но лучше не стоит",
     "Автомобильные кемпинги: новый тренд путешествий",
     "Как не попасть в пробку: полезные сервисы и советы"
-
 ]
-
-
 
 
 # Клавиатура
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.add(types.KeyboardButton(text="🚀 Запустить Елизавету"))
+    builder.add(types.KeyboardButton(text="🛑 Остановить Елизавету"))
     builder.add(types.KeyboardButton(text="📅 Автозаполнение канала"))
     builder.add(types.KeyboardButton(text="📝 Личная история"))
     builder.add(types.KeyboardButton(text="🚗 Автомобильные новости"))
@@ -193,38 +198,43 @@ async def generate_post(theme: str, is_personal: bool) -> str:
         if is_personal:
             prompt = (f"Напиши личную историю от имени Елизаветы на тему '{theme}'. "
                       f"Используй неформальный стиль, эмодзи, сделай текст живым и эмоциональным. "
-                      f"Пиши от первого лица, как будто это дневниковая запись.")
+                      f"Пиши от первого лица, как будто это дневниковая запись. "
+                      f"Длина поста не должна превышать 2000 символов.")
         else:
             prompt = (f"Напиши информативный пост об автомобилях на тему '{theme}'. "
                       f"Используй эмодзи, но сохраняй профессиональный тон. "
-                      f"Добавь интересные факты и актуальную информацию.")
+                      f"Добавь интересные факты и актуальную информацию. "
+                      f"Длина поста не должна превышать 2000 символов.")
 
         response = mistral_client.chat(
             model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        return content[:2000]
     except Exception as e:
-        logging.error(f"Ошибка генерации поста: {e}")
+        logger.error(f"Ошибка генерации поста: {e}")
         return None
 
 
 # Публикация поста
-async def publish_post(theme: str = None, is_personal: bool = True):
+async def publish_post(theme: str = None, is_personal: bool = True) -> bool:
     if not theme:
         theme = random.choice(PERSONAL_STORIES if is_personal else CAR_NEWS)
 
     post_content = await generate_post(theme, is_personal)
-    if post_content:
-        # Сохраняем в БД
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        post_type = "personal" if is_personal else "news"
-        cursor.execute("INSERT INTO posts (content, post_type, created_at) VALUES (?, ?, ?)",
-                       (post_content, post_type, datetime.now()))
-        post_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+    if not post_content:
+        return False
+
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            post_type = "personal" if is_personal else "news"
+            await conn.execute(
+                "INSERT INTO posts (content, post_type, created_at) VALUES (?, ?, ?)",
+                (post_content, post_type, datetime.now())
+            )
+            await conn.commit()
 
         # Публикуем в канал
         if is_personal:
@@ -239,21 +249,48 @@ async def publish_post(theme: str = None, is_personal: bool = True):
             text=f"{header}{post_content}{footer}",
             parse_mode="Markdown"
         )
+        logger.info(f"Успешно опубликован {'личный' if is_personal else 'новостной'} пост")
         return True
-    return False
+    except Exception as e:
+        logger.error(f"Ошибка публикации поста: {e}")
+        return False
 
 
 # Автопостинг
 async def auto_posting():
-    while True:
-        now = datetime.now(TIMEZONE)
-        if now.hour == 9:  # Утренний пост - личная история
-            await publish_post(is_personal=True)
-            await asyncio.sleep(3600 * 12)  # Следующий пост через 12 часов
-        elif now.hour == 21:  # Вечерний пост - автомобильные новости
-            await publish_post(is_personal=False)
-            await asyncio.sleep(3600 * 12)  # Следующий пост через 12 часов
-        await asyncio.sleep(3600)  # Проверка каждый час
+    global auto_posting_running
+    auto_posting_running = True
+
+    logger.info("Автопостинг запущен")
+    while auto_posting_running:
+        try:
+            now = datetime.now(TIMEZONE)
+            if now.hour == 6:  # Утренний пост - личная история
+                if await publish_post(is_personal=True):
+                    logger.info("Утренний пост (личная история) опубликован")
+                await asyncio.sleep(3600 * 12)  # Следующий пост через 12 часов
+            elif now.hour == 14:  # Вечерний пост - автомобильные новости
+                if await publish_post(is_personal=False):
+                    logger.info("Вечерний пост (новости) опубликован")
+                await asyncio.sleep(3600 * 12)  # Следующий пост через 12 часов
+            await asyncio.sleep(3600)  # Проверка каждый час
+        except Exception as e:
+            logger.error(f"Ошибка в автопостинге: {e}")
+            await asyncio.sleep(60)  # Подождать перед повторной попыткой
+
+
+# Остановка автопостинга
+async def stop_auto_posting():
+    global auto_posting_running, auto_posting_task
+    if auto_posting_task and not auto_posting_task.done():
+        auto_posting_running = False
+        auto_posting_task.cancel()
+        try:
+            await auto_posting_task
+        except asyncio.CancelledError:
+            pass
+        auto_posting_task = None
+        logger.info("Автопостинг остановлен")
 
 
 # Обработчики команд
@@ -268,13 +305,29 @@ async def cmd_start(message: types.Message):
 
 @dp.message(lambda message: message.text == "🚀 Запустить Елизавету")
 async def start_elizabeth(message: types.Message):
+    global auto_posting_task
+
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Только администратор может управлять ботом")
         return
 
-    asyncio.create_task(auto_posting())
+    if auto_posting_task and not auto_posting_task.done():
+        await message.answer("ℹ️ Автопостинг уже запущен")
+        return
+
+    auto_posting_task = asyncio.create_task(auto_posting())
     await message.answer(
         "✅ Елизавета запущена! Посты будут публиковаться автоматически (личные истории утром и новости вечером).")
+
+
+@dp.message(lambda message: message.text == "🛑 Остановить Елизавету")
+async def stop_elizabeth(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только администратор может управлять ботом")
+        return
+
+    await stop_auto_posting()
+    await message.answer("🛑 Автопостинг остановлен")
 
 
 @dp.message(lambda message: message.text == "📅 Автозаполнение канала")
@@ -284,11 +337,13 @@ async def auto_fill_channel(message: types.Message):
         return
 
     await message.answer("⏳ Начинаю автозаполнение канала...")
-    for _ in range(3):  # 3 личные истории
+    for i in range(3):  # 3 личные истории
         if await publish_post(is_personal=True):
+            await message.answer(f"✅ Личная история {i + 1}/3 опубликована")
             await asyncio.sleep(600)
-    for _ in range(3):  # 3 новости
+    for i in range(3):  # 3 новости
         if await publish_post(is_personal=False):
+            await message.answer(f"✅ Новость {i + 1}/3 опубликована")
             await asyncio.sleep(600)
     await message.answer("✅ Канал успешно заполнен!")
 
@@ -319,53 +374,74 @@ async def car_news(message: types.Message):
         await message.answer("⚠️ Не удалось опубликовать новость")
 
 
+@dp.message(Command("post"))
+async def cmd_post(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только администратор может управлять ботом")
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer("Использование: /post <personal|news> <тема>")
+        return
+
+    post_type = args[1]
+    theme = args[2]
+
+    if post_type not in ["personal", "news"]:
+        await message.answer("Тип поста должен быть 'personal' или 'news'")
+        return
+
+    if await publish_post(theme, is_personal=(post_type == "personal")):
+        await message.answer("✅ Пост опубликован!")
+    else:
+        await message.answer("⚠️ Не удалось опубликовать пост")
+
+
 @dp.message(lambda message: message.text == "📊 Статистика")
 async def show_stats(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Только администратор может управлять ботом")
         return
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    try:
+        async with aiosqlite.connect(DB_FILE) as conn:
+            cursor = await conn.execute("SELECT COUNT(*) FROM posts WHERE post_type='personal'")
+            personal_count = (await cursor.fetchone())[0]
 
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE post_type='personal'")
-    personal_count = cursor.fetchone()[0]
+            cursor = await conn.execute("SELECT COUNT(*) FROM posts WHERE post_type='news'")
+            news_count = (await cursor.fetchone())[0]
 
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE post_type='news'")
-    news_count = cursor.fetchone()[0]
+            cursor = await conn.execute("SELECT SUM(views) FROM posts")
+            total_views = (await cursor.fetchone())[0] or 0
 
-    cursor.execute("SELECT SUM(views) FROM posts")
-    total_views = cursor.fetchone()[0] or 0
-
-    conn.close()
-
-    await message.answer(
-        f"📊 Статистика канала Елизаветы:\n\n"
-        f"• Личных историй: {personal_count}\n"
-        f"• Автомобильных новостей: {news_count}\n"
-        f"• Всего просмотров: {total_views}"
-    )
+        await message.answer(
+            f"📊 Статистика канала Елизаветы:\n\n"
+            f"• Личных историй: {personal_count}\n"
+            f"• Автомобильных новостей: {news_count}\n"
+            f"• Всего просмотров: {total_views}"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики: {e}")
+        await message.answer("⚠️ Не удалось получить статистику")
 
 
 # Запуск бота
 async def main():
     try:
-        logging.info("Starting Елизавета...")
+        logger.info("Starting Елизавета...")
+        await init_db()
         await bot(DeleteWebhook(drop_pending_updates=True))
         await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Ошибка в основном цикле: {e}")
     finally:
+        await stop_auto_posting()
         await bot.session.close()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
-
-
 
 
 
